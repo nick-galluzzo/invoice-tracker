@@ -1,8 +1,5 @@
 from pydantic import BaseModel
 from pydantic_ai import Agent, BinaryContent
-from dotenv import load_dotenv
-
-load_dotenv()
 
 
 class LineItem(BaseModel):

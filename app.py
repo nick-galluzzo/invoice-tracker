@@ -1,4 +1,10 @@
+import os
 import streamlit as st
+
+os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
+os.environ["SUPABASE_URL"] = st.secrets["SUPABASE_URL"]
+os.environ["SUPABASE_KEY"] = st.secrets["SUPABASE_KEY"]
+
 from extractor import extract_invoice
 from database import save_invoice, list_invoices
 
