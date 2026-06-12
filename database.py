@@ -1,5 +1,8 @@
+import csv
+import io
 import os
 import time
+from datetime import datetime, timezone
 from supabase import create_client
 from dotenv import load_dotenv
 from extractor import Invoice
@@ -52,11 +55,55 @@ def save_invoice(
     return invoice_id
 
 
-def list_invoices():
-    return (
-        supabase.table("invoices")
-        .select("*, invoice_line_items(*)")
-        .order("created_at", desc=True)
-        .execute()
-        .data
+def list_invoices(exported: bool | None = None):
+    query = supabase.table("invoices").select("*, invoice_line_items(*)")
+    if exported is not None:
+        query = query.eq("exported", exported)
+    return query.order("created_at", desc=True).execute().data
+
+
+def mark_invoices_exported(invoice_ids: list[str]) -> None:
+    supabase.table("invoices").update(
+        {
+            "exported": True,
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+        }
+    ).in_("id", invoice_ids).execute()
+
+
+def build_export_csv(invoices: list[dict]) -> bytes:
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(
+        [
+            "Invoice ID",
+            "Supplier",
+            "Invoice Date",
+            "Subtotal",
+            "Tax",
+            "Total",
+            "Item",
+            "Qty",
+            "Unit",
+            "Unit Price",
+            "Line Total",
+        ]
     )
+    for inv in invoices:
+        for item in inv.get("invoice_line_items", []):
+            writer.writerow(
+                [
+                    inv["id"],
+                    inv["supplier_name"],
+                    inv["invoice_date"],
+                    inv["subtotal"],
+                    inv["tax_amount"],
+                    inv["total_amount"],
+                    item["ingredient_name"],
+                    item["quantity"],
+                    item["unit"],
+                    item["unit_price"],
+                    item["total_price"],
+                ]
+            )
+    return output.getvalue().encode("utf-8")

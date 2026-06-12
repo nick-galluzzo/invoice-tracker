@@ -23,7 +23,7 @@ agent = Agent(
     "google-gla:gemini-2.5-flash",
     output_type=list[Invoice],
     system_prompt=(
-        "You extract structured data from restaurant purchase invoices or receipts. "
+        "You extract structured data from restaurant purchase invoices. "
         "Return supplier name, invoice date (YYYY-MM-DD), tax amount, subtotal, total amount, all line items with ingredient name, "
         "quantity, unit (e.g. kg, pcs, liters), unit price, and total price. "
         "If a field is missing or unclear, make a best guess from context."
