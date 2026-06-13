@@ -11,3 +11,8 @@ dependencies = [
     "streamlit>=1.58.0",
     "supabase>=2.31.0",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

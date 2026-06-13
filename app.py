@@ -38,6 +38,7 @@ with tab1:
         "Upload product invoices",
         type=["jpg", "jpeg", "png", "pdf"],
         accept_multiple_files=True,
+        key=f"uploader_{st.session_state.get('uploader_key', 0)}",
     )
 
     # Capture newly dropped files into the queue (deduped by file name)
@@ -55,56 +56,60 @@ with tab1:
                     }
                 )
 
-        queue: list[dict] = st.session_state.get("upload_queue", [])
-        if queue:
-            total = len(queue)
-            succeeded = sum(1 for i in queue if i["status"] == "success")
-            failed = sum(1 for i in queue if i["status"] == "failed")
-            in_progress = sum(
-                1 for i in queue if i["status"] in ("pending", "processing")
+    queue: list[dict] = st.session_state.get("upload_queue", [])
+    if queue:
+        total = len(queue)
+        succeeded = sum(1 for i in queue if i["status"] == "success")
+        failed = sum(1 for i in queue if i["status"] == "failed")
+        in_progress = sum(1 for i in queue if i["status"] in ("pending", "processing"))
+
+        # Progress bar (only meaningful for multiple files)
+        if total > 1:
+            st.progress((succeeded + failed) / total)
+
+        # Status summary
+        if in_progress > 0:
+            st.caption(f"{succeeded + failed} of {total} complete")
+        elif failed == 0:
+            st.success(f"All {total} file{'s' if total != 1 else ''} saved.")
+            st.session_state["upload_queue"] = []
+            st.session_state["uploader_key"] = (
+                st.session_state.get("uploader_key", 0) + 1
             )
+            st.rerun()
+        else:
+            st.warning(f"{succeeded} saved · {failed} failed")
 
-            # Progress bar (only meaningful for multiple files)
-            if total > 1:
-                st.progress((succeeded + failed) / total)
+        # Failed files with retry
+        for i, item in enumerate(queue):
+            if item["status"] == "failed":
+                cols = st.columns([5, 1])
+                cols[0].error(
+                    f"**{item['name']}** — {item['error'] or 'Extraction failed'}"
+                )
+                if cols[1].button("Retry", key=f"retry_{i}"):
+                    st.session_state["upload_queue"][i]["status"] = "pending"
+                    st.session_state["upload_queue"][i]["error"] = None
+                    st.rerun()
 
-            # Status summary
-            if in_progress > 0:
-                st.caption(f"{succeeded + failed} of {total} complete")
-            elif failed == 0:
-                st.success(f"All {total} file{'s' if total != 1 else ''} saved.")
-            else:
-                st.warning(f"{succeeded} saved · {failed} failed")
-
-            # Failed files with retry
-            for i, item in enumerate(queue):
-                if item["status"] == "failed":
-                    cols = st.columns([5, 1])
-                    cols[0].error(
-                        f"**{item['name']}** — {item['error'] or 'Extraction failed'}"
-                    )
-                    if cols[1].button("Retry", key=f"retry_{i}"):
-                        st.session_state["upload_queue"][i]["status"] = "pending"
-                        st.session_state["upload_queue"][i]["error"] = None
-                        st.rerun()
-
-        # Auto-process: pick the next pending file and run it
-        next_idx = next(
-            (i for i, item in enumerate(queue) if item["status"] == "pending"), None
-        )
-        if next_idx is not None:
-            st.session_state["upload_queue"][next_idx]["status"] = "processing"
-            item = st.session_state["upload_queue"][next_idx]
-            with st.spinner(f"Extracting **{item['name']}**…"):
-                try:
-                    invoices = extract_invoice(item["bytes"], item["type"])
-                    for inv in invoices:
+    # Auto-process: pick the next pending file and run it
+    next_idx = next(
+        (i for i, item in enumerate(queue) if item["status"] == "pending"), None
+    )
+    if next_idx is not None:
+        st.session_state["upload_queue"][next_idx]["status"] = "processing"
+        item = st.session_state["upload_queue"][next_idx]
+        with st.spinner(f"Analyzing Invoice Data for **{item['name']}**…"):
+            try:
+                invoices = extract_invoice(item["bytes"], item["type"])
+                for inv in invoices:
+                    if inv.line_items:
                         save_invoice(inv, item["bytes"], item["name"], item["type"])
-                    st.session_state["upload_queue"][next_idx]["status"] = "success"
-                except Exception as e:
-                    st.session_state["upload_queue"][next_idx]["status"] = "failed"
-                    st.session_state["upload_queue"][next_idx]["error"] = str(e)
-            st.rerun()  # Loop to next pending file
+                st.session_state["upload_queue"][next_idx]["status"] = "success"
+            except Exception as e:
+                st.session_state["upload_queue"][next_idx]["status"] = "failed"
+                st.session_state["upload_queue"][next_idx]["error"] = str(e)
+        st.rerun()  # Loop to next pending file
 
 # Tab 2: Ready to export
 with tab2:
@@ -134,17 +139,11 @@ with tab2:
         st.divider()
 
         for inv in invoices:
-            with st.expander(
-                f"{inv['supplier_name']} — {inv['invoice_date']}  ·  ${inv['total_amount']:.2f}"
-            ):
+            with st.expander(f"{inv['supplier_name']} — {inv['invoice_date']}"):
                 st.table(
                     [
                         {
                             "Item": item["ingredient_name"],
-                            "Qty": item["quantity"],
-                            "Unit": item["unit"],
-                            "Unit Price": f"${item['unit_price']:.2f}",
-                            "Total": f"${item['total_price']:.2f}",
                         }
                         for item in inv.get("invoice_line_items", [])
                     ]
@@ -170,7 +169,7 @@ with tab3:
 
         for inv in invoices:
             exported_on = (inv.get("exported_at") or "")[:10]
-            label = f"{inv['supplier_name']} — {inv['invoice_date']}  ·  ${inv['total_amount']:.2f}"
+            label = f"{inv['supplier_name']} — {inv['invoice_date']}"
             if exported_on:
                 label += f"  ·  EXPORTED ON {exported_on}"
             with st.expander(label):
@@ -179,9 +178,6 @@ with tab3:
                         {
                             "Item": item["ingredient_name"],
                             "Qty": item["quantity"],
-                            "Unit": item["unit"],
-                            "Unit Price": f"${item['unit_price']:.2f}",
-                            "Total": f"${item['total_price']:.2f}",
                         }
                         for item in inv.get("invoice_line_items", [])
                     ]
