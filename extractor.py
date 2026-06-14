@@ -32,15 +32,22 @@ class InvoiceDiscount(BaseModel):
 
 class RawLineItem(BaseModel):
     ingredient_name: str
-    quantity: float
-    unit: str
-    unit_price: float
+    quantity: float = Field(description="Number of packs/cases purchased")
+    unit: str = Field(description="The pack or case unit (e.g. pack, box, kg)")
+    unit_price: float = Field(
+        description="Price per pack/case, not per individual item inside the pack"
+    )
     total_price: float
 
 
 class RawInvoice(BaseModel):
-    invoice_id: Optional[str] = None
-    supplier_name: str
+    invoice_id: Optional[str] = Field(
+        default=None,
+        description="The PRIMARY invoice number — the main document identifier issued by the supplier, typically labeled 'Invoice Number', 'เลขที่ใบกำกับภาษี', 'เลขที่', or 'NO.'. Not a PO reference, delivery code, or internal tracking number.",
+    )
+    supplier_name: str = Field(
+        description="the SELLER (the company issuing the invoice). The buyer information may also appear on the invoice. Ignore it."
+    )
     invoice_date: str  # YYYY-MM-DD
     due_date: Optional[Date] = None
     line_items: list[RawLineItem]
