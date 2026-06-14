@@ -1,5 +1,6 @@
 import base64
 import os
+import threading
 from datetime import date
 import streamlit as st
 
@@ -13,25 +14,95 @@ from database import (
     mark_invoices_exported,
     save_invoice,
 )
-from extractor import extract_invoice
+from extractor import RefinedLineItem, VAT_RATE, extract_invoice
+
+
+@st.cache_resource
+def _get_bg_store() -> dict:
+    """Single worker thread + queue — avoids asyncio event loop conflicts from pydantic_ai."""
+    import queue as _q
+
+    store: dict = {"results": {}, "lock": threading.Lock(), "work_queue": _q.Queue()}
+
+    def _worker() -> None:
+        while True:
+            job_id, file_bytes, media_type = store["work_queue"].get()
+            try:
+                invoices = extract_invoice(file_bytes, media_type)
+                with store["lock"]:
+                    store["results"][job_id] = {"ok": True, "invoices": invoices}
+            except Exception as e:
+                with store["lock"]:
+                    store["results"][job_id] = {"ok": False, "error": str(e)}
+            finally:
+                store["work_queue"].task_done()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return store
+
+
+def _extract_background(job_id: str, file_bytes: bytes, media_type: str) -> None:
+    _get_bg_store()["work_queue"].put((job_id, file_bytes, media_type))
+
+
+@st.fragment(run_every=0.5)
+def _poll_bg_results() -> None:
+    """Polls for completed background jobs without causing a full-page rerender."""
+    queue = st.session_state.get("upload_queue", [])
+    if not any(i["status"] == "processing" for i in queue):
+        return
+
+    _store = _get_bg_store()
+    with _store["lock"]:
+        completed = dict(_store["results"])
+
+    changed = False
+    for i, item in enumerate(queue):
+        job_id = item.get("job_id")
+        if item["status"] == "processing" and job_id in completed:
+            result = completed[job_id]
+            if result["ok"] and result["invoices"]:
+                st.session_state["upload_queue"][i]["extracted"] = result["invoices"]
+                st.session_state["upload_queue"][i]["inv_statuses"] = [
+                    "pending_review"
+                ] * len(result["invoices"])
+                st.session_state["upload_queue"][i]["status"] = "needs_review"
+            elif result["ok"]:
+                st.session_state["upload_queue"][i]["status"] = "done"
+            else:
+                st.session_state["upload_queue"][i]["status"] = "failed"
+                st.session_state["upload_queue"][i]["error"] = result["error"]
+            with _store["lock"]:
+                _store["results"].pop(job_id, None)
+            changed = True
+
+    if changed:
+        st.rerun()  # full rerun only when a job actually completed
 
 
 def _line_items_table(line_items: list) -> list[dict]:
     rows = []
     for li in line_items:
         is_dict = isinstance(li, dict)
-        rows.append({
-            "Item": li["ingredient_name"] if is_dict else li.ingredient_name,
-            "Qty": li["quantity"] if is_dict else li.quantity,
-            "Unit": li["unit"] if is_dict else li.unit,
-            "Unit Price": f"฿{(li['unit_price'] if is_dict else li.unit_price):,.2f}",
-            "Total": f"฿{(li['total_price'] if is_dict else li.total_price):,.2f}",
-            "Category": li["category"] if is_dict else li.category,
-            "Sub": (li.get("subcategory") or "—") if is_dict else (li.subcategory or "—"),
-            "VAT": "✓" if (li["is_vat_eligible"] if is_dict else li.is_vat_eligible) else "✗",
-            "Calc. VAT": f"฿{(li['calculated_vat'] if is_dict else li.calculated_vat):,.2f}",
-        })
+        rows.append(
+            {
+                "Item": li["ingredient_name"] if is_dict else li.ingredient_name,
+                "Qty": li["quantity"] if is_dict else li.quantity,
+                "Unit": li["unit"] if is_dict else li.unit,
+                "Unit Price": f"฿{(li['unit_price'] if is_dict else li.unit_price):,.2f}",
+                "Total": f"฿{(li['total_price'] if is_dict else li.total_price):,.2f}",
+                "Category": li["category"] if is_dict else li.category,
+                "Sub": (li.get("subcategory") or "—")
+                if is_dict
+                else (li.subcategory or "—"),
+                "VAT": "✓"
+                if (li["is_vat_eligible"] if is_dict else li.is_vat_eligible)
+                else "✗",
+                "Calc. VAT": f"฿{(li['calculated_vat'] if is_dict else li.calculated_vat):,.2f}",
+            }
+        )
     return rows
+
 
 # Auth
 if "authenticated" not in st.session_state:
@@ -91,7 +162,9 @@ with tab1:
 
         # Status summary
         if in_progress > 0:
-            st.caption(f"Extracting… {done} of {total} files done")
+            st.caption(
+                f"⏳ Extracting {in_progress} file{'s' if in_progress != 1 else ''}… ({done} of {total} done)"
+            )
 
         # All done — clear queue
         if in_progress == 0 and needs_review == 0:
@@ -120,7 +193,8 @@ with tab1:
 
         # ── Review section ──────────────────────────────────────────────────────
         review_items = [
-            (qi, item) for qi, item in enumerate(queue)
+            (qi, item)
+            for qi, item in enumerate(queue)
             if item["status"] == "needs_review"
         ]
 
@@ -149,107 +223,190 @@ with tab1:
                         )
 
                     with st.container(border=True):
-                        with st.form(key=f"review_{queue_idx}_{inv_idx}"):
-                            # Editable header
-                            c1, c2, c3 = st.columns([3, 3, 2])
-                            new_supplier = c1.text_input(
-                                "Supplier", value=inv.supplier_name
-                            )
-                            new_invoice_id = c2.text_input(
-                                "Invoice #", value=inv.invoice_id or ""
-                            )
-                            c3.text_input(
-                                "Date", value=inv.invoice_date, disabled=True
-                            )
+                        doc_col, form_col = st.columns([2, 3])
 
-                            # Math validation badge
-                            if inv.math_validated:
-                                st.caption("✅ Math validated")
+                        # ── Document viewer ────────────────────────────────────
+                        with doc_col:
+                            if item["type"].startswith("image/"):
+                                st.image(item["bytes"], use_container_width=True)
                             else:
-                                st.warning(
-                                    "⚠️ Math mismatch — verify totals before saving"
+                                b64 = base64.b64encode(item["bytes"]).decode()
+                                st.markdown(
+                                    f'<iframe src="data:application/pdf;base64,{b64}" '
+                                    f'width="100%" height="780px" style="border:none;border-radius:6px;"></iframe>',
+                                    unsafe_allow_html=True,
                                 )
 
-                            # Totals
-                            m1, m2, m3 = st.columns(3)
-                            m1.metric("Subtotal", f"฿{inv.subtotal:,.2f}")
-                            m2.metric("VAT (7%)", f"฿{inv.tax_amount:,.2f}")
-                            m3.metric("Total", f"฿{inv.total_amount:,.2f}")
+                        # ── Review form ────────────────────────────────────────
+                        with form_col:
+                            with st.form(key=f"review_{queue_idx}_{inv_idx}"):
+                                # Editable header
+                                c1, c2, c3 = st.columns([3, 3, 2])
+                                new_supplier = c1.text_input(
+                                    "Supplier", value=inv.supplier_name
+                                )
+                                new_invoice_id = c2.text_input(
+                                    "Invoice #", value=inv.invoice_id or ""
+                                )
+                                c3.text_input(
+                                    "Date", value=inv.invoice_date, disabled=True
+                                )
 
-                            # Discounts
-                            if inv.global_discounts:
-                                parts = [
-                                    f"{d.discount_type.value} −฿{d.amount:,.2f}"
-                                    for d in inv.global_discounts
+                                # Math validation badge
+                                if inv.math_validated:
+                                    st.caption("✅ Math validated")
+                                else:
+                                    st.warning("⚠️ Verify totals before saving")
+
+                                # Totals
+                                m1, m2, m3 = st.columns(3)
+                                m1.metric("Subtotal", f"฿{inv.subtotal:,.2f}")
+                                m2.metric("VAT (7%)", f"฿{inv.tax_amount:,.2f}")
+                                m3.metric("Total", f"฿{inv.total_amount:,.2f}")
+
+                                # Discounts
+                                if inv.global_discounts:
+                                    parts = [
+                                        f"{d.discount_type.value} −฿{d.amount:,.2f}"
+                                        for d in inv.global_discounts
+                                    ]
+                                    st.caption(f"Discounts: {' · '.join(parts)}")
+
+                                # Editable line items
+                                st.caption(
+                                    "Edit any field directly in the table below."
+                                )
+                                edited_df = st.data_editor(
+                                    [
+                                        {
+                                            "Item": li.ingredient_name,
+                                            "Qty": li.quantity,
+                                            "Unit": li.unit,
+                                            "Unit Price": li.unit_price,
+                                            "Total": li.total_price,
+                                            "Category": li.category,
+                                            "Sub": li.subcategory or "",
+                                            "VAT?": li.is_vat_eligible,
+                                        }
+                                        for li in inv.line_items
+                                    ],
+                                    column_config={
+                                        "Qty": st.column_config.NumberColumn("Qty"),
+                                        "Unit Price": st.column_config.NumberColumn(
+                                            "Unit Price", format="฿%.2f"
+                                        ),
+                                        "Total": st.column_config.NumberColumn(
+                                            "Total", format="฿%.2f"
+                                        ),
+                                        "Category": st.column_config.SelectboxColumn(
+                                            "Category",
+                                            options=[
+                                                "Cleaning Supplies",
+                                                "Kitchen Supplies",
+                                                "COGS Food",
+                                                "Equipment: Kitchen",
+                                                "Equipment: Operation",
+                                                "Supplies: Operation",
+                                            ],
+                                        ),
+                                        "Sub": st.column_config.SelectboxColumn(
+                                            "Sub",
+                                            options=[
+                                                "",
+                                                "Food Ingredients",
+                                                "Food Packaging",
+                                            ],
+                                        ),
+                                        "VAT?": st.column_config.CheckboxColumn("VAT?"),
+                                    },
+                                    use_container_width=True,
+                                    hide_index=True,
+                                    num_rows="fixed",
+                                )
+
+                                # Action buttons
+                                _, b1, b2 = st.columns([4, 1, 1])
+                                discard = b1.form_submit_button(
+                                    "Discard", use_container_width=True
+                                )
+                                confirm = b2.form_submit_button(
+                                    "Confirm & Save",
+                                    type="primary",
+                                    use_container_width=True,
+                                )
+
+                            if confirm:
+                                modified_items = [
+                                    RefinedLineItem(
+                                        ingredient_name=str(row["Item"]),
+                                        quantity=float(row["Qty"]),
+                                        unit=str(row["Unit"]),
+                                        unit_price=float(row["Unit Price"]),
+                                        total_price=float(row["Total"]),
+                                        category=row["Category"],
+                                        subcategory=row["Sub"] or None,
+                                        is_vat_eligible=bool(row["VAT?"]),
+                                        calculated_vat=round(
+                                            float(row["Total"]) * VAT_RATE, 2
+                                        )
+                                        if row["VAT?"]
+                                        else 0.0,
+                                    )
+                                    for row in edited_df
                                 ]
-                                st.caption(f"Discounts: {' · '.join(parts)}")
+                                edited_inv = inv.model_copy(
+                                    update={
+                                        "supplier_name": new_supplier,
+                                        "invoice_id": new_invoice_id or None,
+                                        "line_items": modified_items,
+                                    }
+                                )
+                                save_invoice(
+                                    edited_inv,
+                                    item["bytes"],
+                                    item["name"],
+                                    item["type"],
+                                )
+                                st.session_state["upload_queue"][queue_idx][
+                                    "inv_statuses"
+                                ][inv_idx] = "confirmed"
+                                if all(
+                                    s != "pending_review"
+                                    for s in st.session_state["upload_queue"][
+                                        queue_idx
+                                    ]["inv_statuses"]
+                                ):
+                                    st.session_state["upload_queue"][queue_idx][
+                                        "status"
+                                    ] = "done"
+                                st.rerun()
 
-                            # Line items
-                            st.dataframe(
-                                _line_items_table(inv.line_items),
-                                use_container_width=True,
-                                hide_index=True,
-                            )
+                            if discard:
+                                st.session_state["upload_queue"][queue_idx][
+                                    "inv_statuses"
+                                ][inv_idx] = "discarded"
+                                if all(
+                                    s != "pending_review"
+                                    for s in st.session_state["upload_queue"][
+                                        queue_idx
+                                    ]["inv_statuses"]
+                                ):
+                                    st.session_state["upload_queue"][queue_idx][
+                                        "status"
+                                    ] = "done"
+                                st.rerun()
 
-                            # Action buttons
-                            _, b1, b2 = st.columns([4, 1, 1])
-                            discard = b1.form_submit_button(
-                                "Discard", use_container_width=True
-                            )
-                            confirm = b2.form_submit_button(
-                                "Confirm & Save",
-                                type="primary",
-                                use_container_width=True,
-                            )
+    # Enqueue pending files for the background worker
+    for i, item in enumerate(queue):
+        if item["status"] == "pending":
+            job_id = f"job_{i}_{item['name']}"
+            st.session_state["upload_queue"][i]["status"] = "processing"
+            st.session_state["upload_queue"][i]["job_id"] = job_id
+            _extract_background(job_id, item["bytes"], item["type"])
 
-                        if confirm:
-                            edited = inv.model_copy(
-                                update={
-                                    "supplier_name": new_supplier,
-                                    "invoice_id": new_invoice_id or None,
-                                }
-                            )
-                            save_invoice(edited, item["bytes"], item["name"], item["type"])
-                            st.session_state["upload_queue"][queue_idx]["inv_statuses"][inv_idx] = "confirmed"
-                            if all(
-                                s != "pending_review"
-                                for s in st.session_state["upload_queue"][queue_idx]["inv_statuses"]
-                            ):
-                                st.session_state["upload_queue"][queue_idx]["status"] = "done"
-                            st.rerun()
-
-                        if discard:
-                            st.session_state["upload_queue"][queue_idx]["inv_statuses"][inv_idx] = "discarded"
-                            if all(
-                                s != "pending_review"
-                                for s in st.session_state["upload_queue"][queue_idx]["inv_statuses"]
-                            ):
-                                st.session_state["upload_queue"][queue_idx]["status"] = "done"
-                            st.rerun()
-
-    # Auto-process: pick the next pending file and run it
-    next_idx = next(
-        (i for i, item in enumerate(queue) if item["status"] == "pending"), None
-    )
-    if next_idx is not None:
-        st.session_state["upload_queue"][next_idx]["status"] = "processing"
-        item = st.session_state["upload_queue"][next_idx]
-        with st.spinner(f"Extracting **{item['name']}**…"):
-            try:
-                invoices = extract_invoice(item["bytes"], item["type"])
-                if invoices:
-                    st.session_state["upload_queue"][next_idx]["extracted"] = invoices
-                    st.session_state["upload_queue"][next_idx]["inv_statuses"] = (
-                        ["pending_review"] * len(invoices)
-                    )
-                    st.session_state["upload_queue"][next_idx]["status"] = "needs_review"
-                else:
-                    # All pages were receipts — nothing to review
-                    st.session_state["upload_queue"][next_idx]["status"] = "done"
-            except Exception as e:
-                st.session_state["upload_queue"][next_idx]["status"] = "failed"
-                st.session_state["upload_queue"][next_idx]["error"] = str(e)
-        st.rerun()
+    # Poll for results without dimming the page
+    if any(i["status"] == "processing" for i in queue):
+        _poll_bg_results()
 
 # Tab 2: Ready to export
 with tab2:

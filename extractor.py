@@ -46,7 +46,15 @@ class RawInvoice(BaseModel):
         description="The PRIMARY invoice number — the main document identifier issued by the supplier, typically labeled 'Invoice Number', 'เลขที่ใบกำกับภาษี', 'เลขที่', or 'NO.'. Not a PO reference, delivery code, or internal tracking number.",
     )
     supplier_name: str = Field(
-        description="the SELLER (the company issuing the invoice). The buyer information may also appear on the invoice. Ignore it."
+        description=(
+            "The SELLER — the company that ISSUED this invoice. "
+            "On Thai invoices the seller's name appears at the TOP of the document, "
+            "usually in the header alongside their address, tax ID (เลขประจำตัวผู้เสียภาษี), and logo. "
+            "The BUYER appears lower, often after 'เรียน', 'ชื่อลูกค้า', 'Bill To', or 'Customer'. "
+            "Extract only the seller. Ignore the buyer completely. "
+            "If the seller's name appears in both Thai and English on the document, use the English form. "
+            "Otherwise translate the Thai name directly to English."
+        )
     )
     invoice_date: str  # YYYY-MM-DD
     due_date: Optional[Date] = None
