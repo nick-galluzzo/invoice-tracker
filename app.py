@@ -241,15 +241,25 @@ with tab1:
                         with form_col:
                             with st.form(key=f"review_{queue_idx}_{inv_idx}"):
                                 # Editable header
-                                c1, c2, c3 = st.columns([3, 3, 2])
+                                c1, c2 = st.columns([3, 3])
                                 new_supplier = c1.text_input(
                                     "Supplier", value=inv.supplier_name
                                 )
                                 new_invoice_id = c2.text_input(
                                     "Invoice #", value=inv.invoice_id or ""
                                 )
-                                c3.text_input(
-                                    "Date", value=inv.invoice_date, disabled=True
+                                d1, d2 = st.columns(2)
+                                _inv_date = (
+                                    date.fromisoformat(inv.invoice_date)
+                                    if inv.invoice_date
+                                    else date.today()
+                                )
+                                new_invoice_date = d1.date_input(
+                                    "Invoice Date", value=_inv_date
+                                )
+                                new_due_date = d2.date_input(
+                                    "Due Date",
+                                    value=inv.due_date if inv.due_date else None,
                                 )
 
                                 # Math validation badge
@@ -358,6 +368,8 @@ with tab1:
                                     update={
                                         "supplier_name": new_supplier,
                                         "invoice_id": new_invoice_id or None,
+                                        "invoice_date": new_invoice_date.isoformat(),
+                                        "due_date": new_due_date,
                                         "line_items": modified_items,
                                     }
                                 )

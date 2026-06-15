@@ -26,7 +26,7 @@ class InvoiceDiscount(BaseModel):
     amount: float
     raw_text: Optional[str] = Field(
         default=None,
-        description="The exact text printed (in English and exact language if different than english) on the invoice next to the discount.",
+        description="The exact text printed (in the exact language. do not translate) on the invoice next to the discount.",
     )
 
 
@@ -52,8 +52,7 @@ class RawInvoice(BaseModel):
             "usually in the header alongside their address, tax ID (เลขประจำตัวผู้เสียภาษี), and logo. "
             "The BUYER appears lower, often after 'เรียน', 'ชื่อลูกค้า', 'Bill To', or 'Customer'. "
             "Extract only the seller. Ignore the buyer completely. "
-            "If the seller's name appears in both Thai and English on the document, use the English form. "
-            "Otherwise translate the Thai name directly to English."
+            "Do not translate the Thai name directly to English. Keep the information in its original language"
         )
     )
     invoice_date: str  # YYYY-MM-DD
@@ -214,8 +213,8 @@ product_invoice_agent = Agent(
         "Do not calculate tax or categorize products yourself.\n"
         "If the invoice shows separate VAT base and exempt base amounts, extract them into "
         "declared_vat_base and declared_non_vat_base.\n"
-        "Translate product names and supplier names to English."
-        "If the original is in another language, translate everything to English."
+        "Keep product names and supplier names in the original language."
+        "Don't translate anything. Ensure all extracted information stays in the original language."
     ),
 )
 
